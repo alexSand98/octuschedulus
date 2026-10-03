@@ -1,0 +1,160 @@
+name: sandbox-platform
+
+# Fixed network name: the consumers attach sandbox containers to it (SANDBOX_NETWORK)
+# so they can probe them by container name before reporting them ready.
+networks:
+  default:
+    name: sandbox-net
+
+volumes:
+  redis-data:
+
+x-app-env: &app-env
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: INFO
+
+x-consumer-env: &consumer-env
+  <<: *app-env
+  METRICS_PORT: "8001"
+  INTERNAL_PORT: "9000"
+  SANDBOX_IMAGE: python:3.12-slim
+  SANDBOX_PUBLIC_HOST: localhost
+  SANDBOX_NETWORK: sandbox-net
+  SANDBOX_TTL_SECONDS: "60"
+  # Per variant. At 0.5 jobs/s and a 60s TTL a variant can hold ~33 sandboxes at 100% traffic.
+  MAX_SANDBOXES: "50"
+
+x-consumer: &consumer
+  build:
+    context: .
+    dockerfile: consumer/Dockerfile
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  # INTERNAL_PORT stays inside the Compose network (used by the rollout controller).
+  expose: ["9000"]
+  # Time to finish the in-flight read/job and remove its sandboxes before Docker sends SIGKILL.
+  stop_grace_period: 60s
+  labels:
+    logs.collect: "true"
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    environment:
+      <<: *app-env
+      HTTP_PORT: "8000"
+      AB_MODE_ENABLED: "true"
+      STABLE_STREAM: jobs:stable
+      PRERELEASE_STREAM: jobs:prerelease
+    ports: ["8000:8000"]
+    labels:
+      logs.collect: "true"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  consumer-stable:
+    <<: *consumer
+    environment:
+      <<: *consumer-env
+      STREAM_NAME: jobs:stable
+      CONSUMER_GROUP: workers-stable
+      CONSUMER_NAME: consumer-stable-1
+      APP_VERSION: v1
+      VARIANT: stable
+    ports: ["8001:8001"]
+
+  consumer-prerelease:
+    <<: *consumer
+    environment:
+      <<: *consumer-env
+      STREAM_NAME: jobs:prerelease
+      CONSUMER_GROUP: workers-prerelease
+      CONSUMER_NAME: consumer-prerelease-1
+      # Change the version to start a new rollout: PRERELEASE_VERSION=v2-rc2 docker compose up -d consumer-prerelease
+      APP_VERSION: ${PRERELEASE_VERSION:-v2-rc}
+      VARIANT: prerelease
+      FAILURE_INJECTION_PERCENT: ${PRERELEASE_FAILURE_INJECTION_PERCENT:-0}
+    ports: ["8002:8001"]
+
+  rollout-controller:
+    build:
+      context: .
+      dockerfile: rollout-controller/Dockerfile
+    environment:
+      <<: *app-env
+      STABLE_STATUS_URL: http://consumer-stable:9000/internal/status
+      PRERELEASE_STATUS_URL: http://consumer-prerelease:9000/internal/status
+      ROLLOUT_STEPS: "10,25,50,100"
+      EVAL_INTERVAL_SECONDS: "15"
+      MIN_HOLD_SECONDS: "60"
+      MIN_SAMPLES: "5"
+      STEP_TIMEOUT_SECONDS: "300"
+      MIN_SUCCESS_RATIO: "0.95"
+      MAX_SUCCESS_DIFF: "0.02"
+      MAX_PROBE_FAILURES: "4"
+      METRICS_PORT: "8003"
+    ports: ["8003:8003"]
+    labels:
+      logs.collect: "true"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  loadgen:
+    build:
+      context: .
+      dockerfile: loadgen/Dockerfile
+    environment:
+      LOG_LEVEL: INFO
+      PRODUCER_URL: http://producer:8000/jobs
+      LOADGEN_RATE_PER_SEC: "0.5"
+    labels:
+      logs.collect: "true"
+    depends_on: [producer]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/sandbox-overview.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    restart: unless-stopped

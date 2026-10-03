@@ -1,0 +1,55 @@
+// Ship JSON logs of producer/consumer (containers labelled logs.collect=true) to Loki.
+
+discovery.docker "apps" {
+  host = "unix:///var/run/docker.sock"
+
+  filter {
+    name   = "label"
+    values = ["logs.collect=true"]
+  }
+}
+
+discovery.relabel "apps" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "apps" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.apps.targets
+  relabel_rules = discovery.relabel.apps.rules
+  forward_to    = [loki.process.json.receiver]
+}
+
+// Promote low-cardinality fields to labels; jobId/traceId stay in the line and are
+// filtered with LogQL (e.g. |= "<jobId>" or | json | jobId="<jobId>").
+loki.process "json" {
+  stage.json {
+    expressions = {
+      level   = "level",
+      service = "service",
+      stage   = "stage",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level   = "",
+      service = "",
+      stage   = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

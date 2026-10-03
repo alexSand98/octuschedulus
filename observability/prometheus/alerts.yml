@@ -1,0 +1,84 @@
+groups:
+  - name: sandbox-platform
+    rules:
+      - alert: ServiceDown
+        expr: up{job=~"producer|consumer|rollout_controller"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is down (scrape of {{ $labels.instance }} failing)"
+
+      - alert: PublishErrors
+        expr: |
+          sum(rate(events_published_total{status="error"}[5m]))
+            / sum(rate(events_published_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Producer publish error ratio is {{ $value | humanizePercentage }}"
+
+      - alert: QueueBacklog
+        expr: max by (variant) (queue_oldest_pending_age_seconds) > 60
+        for: 2m
+        labels:
+          severity: warning
+          condition: oldest_pending_age
+        annotations:
+          summary: "Oldest pending {{ $labels.variant }} job is {{ $value | humanizeDuration }} old"
+
+      - alert: QueueBacklog
+        expr: deriv(queue_pending_messages[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          condition: pending_growing
+        annotations:
+          summary: "Pending messages on {{ $labels.stream }} keep increasing"
+
+      - alert: SandboxFailures
+        expr: |
+          sum by (variant) (rate(sandbox_failures_total[5m]))
+            / sum by (variant) (rate(events_consumed_total{result=~"success|failed"}[5m])) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.variant }} sandbox failure ratio is {{ $value | humanizePercentage }}"
+
+      - alert: SlowSandboxStart
+        expr: |
+          histogram_quantile(0.95, sum by (le, variant) (rate(sandbox_start_duration_seconds_bucket[5m]))) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 {{ $labels.variant }} sandbox start time is {{ $value | humanizeDuration }}"
+
+      - alert: CapacityHigh
+        expr: max by (variant) (sandboxes_active) / max by (variant) (sandboxes_max) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.variant }} sandbox capacity at {{ $value | humanizePercentage }}"
+
+      - alert: RolloutAborted
+        expr: rollout_status == 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pre-release rollout aborted; all traffic is back on stable"
+
+      # 7m = STEP_TIMEOUT_SECONDS (300s) + 2m; update both if the timeout changes.
+      # The sample count (7m / 15s scrape ≈ 28) avoids firing right after a controller restart.
+      - alert: RolloutStuck
+        expr: |
+          rollout_status == 1
+            and changes(rollout_percent[7m]) == 0
+            and count_over_time(rollout_percent[7m]) >= 25
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rollout is progressing but its traffic percent has not changed for over 7m"

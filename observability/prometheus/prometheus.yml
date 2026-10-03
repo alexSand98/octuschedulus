@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alerts are evaluated and shown at http://localhost:9090/alerts (no Alertmanager in this stack).
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: producer
+    static_configs:
+      - targets: ["producer:8000"]
+
+  # Both variants; their metrics carry version/variant labels. Stream length and
+  # pending counts are exported by each consumer for its own stream.
+  - job_name: consumer
+    static_configs:
+      - targets: ["consumer-stable:8001", "consumer-prerelease:8001"]
+
+  - job_name: rollout_controller
+    static_configs:
+      - targets: ["rollout-controller:8003"]
